@@ -14,9 +14,10 @@ import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
 import { callerKey, consumeQuota } from "../../shared/usageGuard.ts";
 
 const MAX_TEXT_LENGTH = 20000;
-const MAX_LLM_TEXT_LENGTH = 2000;
+const MAX_LLM_CHUNK_LENGTH = 2000;
+const MAX_LLM_CHUNKS = 5;
 const CALLS_PER_CALLER_PER_MINUTE = 40;
-const LLM_CALLS_PER_CALLER_PER_HOUR = 3;
+const LLM_UNITS_PER_CALLER_PER_HOUR = 120;
 
 const LANGUAGE_NAMES = {
   en: "English", uk: "Ukrainian", es: "Spanish", fr: "French", de: "German",
@@ -87,6 +88,25 @@ async function translateWithGoogle(text) {
   return { translatedText: translatedText, sourceLanguage: sourceLanguage, wasTranslated: wasTranslated };
 }
 
+async function translateWithLLM(base44, chunk) {
+  const result = await base44.asServiceRole.integrations.Core.InvokeLLM({
+    prompt: "You are a translation engine. Translate the following text to English. If the text is already in English, return it unchanged. Detect the source language and provide its name in English.\n\nText:\n\"\"\"" + chunk + "\"\"\"",
+    response_json_schema: {
+      type: "object",
+      properties: {
+        translatedText: { type: "string" },
+        sourceLanguage: { type: "string" }
+      },
+      required: ["translatedText", "sourceLanguage"]
+    }
+  });
+
+  return {
+    translatedText: (result?.translatedText || chunk).trim(),
+    sourceLanguage: (result?.sourceLanguage || "Unknown").trim(),
+  };
+}
+
 export default async function(req) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -125,12 +145,20 @@ export default async function(req) {
       const result = await translateWithGoogle(text);
       return Response.json(result);
     } catch (googleError) {
-      // Fallback: LLM translation, only within a small per-caller hourly budget
+      // Fallback: billable LLM translation, bounded per caller and per chunk
+      const chunks = chunkText(text, MAX_LLM_CHUNK_LENGTH);
+      if (chunks.length > MAX_LLM_CHUNKS) {
+        return Response.json(
+          { error: "text is too long for translation right now", translatedText: null },
+          { status: 400 }
+        );
+      }
+
       const withinLlmBudget = await consumeQuota(
         base44,
         `translate-llm:${caller}`,
-        1,
-        LLM_CALLS_PER_CALLER_PER_HOUR,
+        chunks.length,
+        LLM_UNITS_PER_CALLER_PER_HOUR,
         60 * 60
       );
       if (!withinLlmBudget) {
@@ -140,24 +168,19 @@ export default async function(req) {
         );
       }
 
-      const safeText = text.slice(0, MAX_LLM_TEXT_LENGTH);
-      const result = await base44.asServiceRole.integrations.Core.InvokeLLM({
-        prompt: "You are a translation engine. Translate the following text to English. If the text is already in English, return it unchanged. Detect the source language and provide its name in English.\n\nText:\n\"\"\"" + safeText + "\"\"\"",
-        response_json_schema: {
-          type: "object",
-          properties: {
-            translatedText: { type: "string" },
-            sourceLanguage: { type: "string" }
-          },
-          required: ["translatedText", "sourceLanguage"]
-        }
+      const parts = [];
+      let sourceLanguage = "Unknown";
+      for (const chunk of chunks) {
+        const part = await translateWithLLM(base44, chunk);
+        parts.push(part.translatedText);
+        if (part.sourceLanguage !== "Unknown") sourceLanguage = part.sourceLanguage;
+      }
+
+      return Response.json({
+        translatedText: parts.join(" ").trim(),
+        sourceLanguage: sourceLanguage,
+        wasTranslated: sourceLanguage.toLowerCase() !== "english",
       });
-
-      const translatedText = (result?.translatedText || text).trim();
-      const sourceLanguage = (result?.sourceLanguage || "Unknown").trim();
-      const wasTranslated = sourceLanguage.toLowerCase() !== "english";
-
-      return Response.json({ translatedText: translatedText, sourceLanguage: sourceLanguage, wasTranslated: wasTranslated });
     }
   } catch (error) {
     return Response.json({ error: error.message, translatedText: null }, { status: 500 });
