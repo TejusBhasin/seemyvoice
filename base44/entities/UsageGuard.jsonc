@@ -1,0 +1,44 @@
+{
+  "name": "UsageGuard",
+  "type": "object",
+  "properties": {
+    "guard_key": {
+      "type": "string",
+      "description": "Scope plus a hashed caller key, e.g. 'words:<hash>'"
+    },
+    "count": {
+      "type": "number",
+      "default": 0,
+      "description": "Units consumed inside the current window"
+    },
+    "window_start": {
+      "type": "number",
+      "description": "Epoch milliseconds when the current window started"
+    }
+  },
+  "required": [
+    "guard_key"
+  ],
+  "rls": {
+    "read": {
+      "user_condition": {
+        "role": "admin"
+      }
+    },
+    "create": {
+      "user_condition": {
+        "role": "admin"
+      }
+    },
+    "update": {
+      "user_condition": {
+        "role": "admin"
+      }
+    },
+    "delete": {
+      "user_condition": {
+        "role": "admin"
+      }
+    }
+  }
+}

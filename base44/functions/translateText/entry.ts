@@ -3,10 +3,20 @@
  * using Google Translate's free endpoint (no API key, no AI).
  * Falls back to the built-in LLM if the free endpoint is unavailable.
  *
+ * The app has no sign-in, so the paid fallback is budgeted per caller: input
+ * length is bounded, calls are rate limited, and the billable LLM path has its
+ * own much smaller hourly allowance.
+ *
  * Input:  { text: string }
  * Output: { translatedText: string, sourceLanguage: string, wasTranslated: boolean }
  */
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
+import { callerKey, consumeQuota } from "../../shared/usageGuard.ts";
+
+const MAX_TEXT_LENGTH = 20000;
+const MAX_LLM_TEXT_LENGTH = 2000;
+const CALLS_PER_CALLER_PER_MINUTE = 40;
+const LLM_CALLS_PER_CALLER_PER_HOUR = 3;
 
 const LANGUAGE_NAMES = {
   en: "English", uk: "Ukrainian", es: "Spanish", fr: "French", de: "German",
@@ -53,9 +63,10 @@ async function translateWithGoogle(text) {
 
     const resp = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; ASLTranslate/1.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; SeeMyVoice/1.0)",
         "Accept": "application/json",
       },
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!resp.ok) {
@@ -78,11 +89,35 @@ async function translateWithGoogle(text) {
 
 export default async function(req) {
   try {
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
     const text = body?.text;
 
     if (!text || typeof text !== "string" || !text.trim()) {
       return Response.json({ error: "text is required" }, { status: 400 });
+    }
+
+    if (text.length > MAX_TEXT_LENGTH) {
+      return Response.json(
+        { error: "text is too long", translatedText: null },
+        { status: 400 }
+      );
+    }
+
+    const base44 = createClientFromRequest(req);
+    const caller = await callerKey(req);
+
+    const withinRateLimit = await consumeQuota(
+      base44,
+      `translate:${caller}`,
+      1,
+      CALLS_PER_CALLER_PER_MINUTE,
+      60
+    );
+    if (!withinRateLimit) {
+      return Response.json(
+        { error: "Too many requests. Please wait a moment and try again.", translatedText: null },
+        { status: 429 }
+      );
     }
 
     try {
@@ -90,10 +125,24 @@ export default async function(req) {
       const result = await translateWithGoogle(text);
       return Response.json(result);
     } catch (googleError) {
-      // Fallback: LLM translation if the free endpoint is unavailable
-      const base44 = createClientFromRequest(req);
+      // Fallback: LLM translation, only within a small per-caller hourly budget
+      const withinLlmBudget = await consumeQuota(
+        base44,
+        `translate-llm:${caller}`,
+        1,
+        LLM_CALLS_PER_CALLER_PER_HOUR,
+        60 * 60
+      );
+      if (!withinLlmBudget) {
+        return Response.json(
+          { error: "Translation is busy right now. Please try again shortly.", translatedText: null },
+          { status: 429 }
+        );
+      }
+
+      const safeText = text.slice(0, MAX_LLM_TEXT_LENGTH);
       const result = await base44.asServiceRole.integrations.Core.InvokeLLM({
-        prompt: "You are a translation engine. Translate the following text to English. If the text is already in English, return it unchanged. Detect the source language and provide its name in English.\n\nText:\n\"\"\"" + text + "\"\"\"",
+        prompt: "You are a translation engine. Translate the following text to English. If the text is already in English, return it unchanged. Detect the source language and provide its name in English.\n\nText:\n\"\"\"" + safeText + "\"\"\"",
         response_json_schema: {
           type: "object",
           properties: {
