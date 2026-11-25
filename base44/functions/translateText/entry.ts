@@ -11,13 +11,16 @@
  * Output: { translatedText: string, sourceLanguage: string, wasTranslated: boolean }
  */
 import { createClientFromRequest } from 'npm:@base44/sdk@0.8.40';
+import { waitUntil } from "base44:runtime";
 import { callerKey, consumeQuota } from "../../shared/usageGuard.ts";
+import { countWords, incrementStats } from "../../shared/siteStats.ts";
 
 const MAX_TEXT_LENGTH = 20000;
 const MAX_LLM_CHUNK_LENGTH = 2000;
 const MAX_LLM_CHUNKS = 5;
 const CALLS_PER_CALLER_PER_MINUTE = 40;
 const LLM_UNITS_PER_CALLER_PER_HOUR = 120;
+const WORDS_PER_CALLER_PER_DAY = 50000;
 
 const LANGUAGE_NAMES = {
   en: "English", uk: "Ukrainian", es: "Spanish", fr: "French", de: "German",
@@ -107,6 +110,30 @@ async function translateWithLLM(base44, chunk) {
   };
 }
 
+/**
+ * Counts the words this request actually translated. Runs after the response is
+ * sent, so it never slows down or breaks a translation.
+ */
+async function recordTranslatedWords(base44, caller, text) {
+  try {
+    const words = countWords(text);
+    if (words <= 0) return;
+
+    const withinBudget = await consumeQuota(
+      base44,
+      `words:${caller}`,
+      words,
+      WORDS_PER_CALLER_PER_DAY,
+      24 * 60 * 60
+    );
+    if (!withinBudget) return;
+
+    await incrementStats(base44, { words });
+  } catch (e) {
+    // Statistics must never affect the translation result.
+  }
+}
+
 export default async function(req) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -143,6 +170,7 @@ export default async function(req) {
     try {
       // Primary: free Google Translate endpoint (no API key, no AI)
       const result = await translateWithGoogle(text);
+      waitUntil(recordTranslatedWords(base44, caller, text));
       return Response.json(result);
     } catch (googleError) {
       // Fallback: billable LLM translation, bounded per caller and per chunk
@@ -175,6 +203,8 @@ export default async function(req) {
         parts.push(part.translatedText);
         if (part.sourceLanguage !== "Unknown") sourceLanguage = part.sourceLanguage;
       }
+
+      waitUntil(recordTranslatedWords(base44, caller, text));
 
       return Response.json({
         translatedText: parts.join(" ").trim(),
